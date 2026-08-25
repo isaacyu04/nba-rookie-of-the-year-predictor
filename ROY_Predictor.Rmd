@@ -1,0 +1,595 @@
+---
+title: "NBA Future Analytics Stars Tech Challenge"
+author: "Isaac Yu"
+date: "`r Sys.Date()`"
+output: pdf_document
+---
+
+This project was completed for the NBA's Rising Stars Analyst Program. It attempts to predict the 2025-2026 Rookie of the Year from historical data. (*Note: "." encodes to "%" and the variable "X..." refers to "+/-"*)
+
+```{r, warning = FALSE}
+library(dplyr)
+library(stringi)
+library(stringr)
+library(ggplot2)
+library(corrplot)
+library(gridExtra)
+
+library(caret)
+library(glmnet)
+library(ROCR)
+library(e1071)
+library(randomForest)
+```
+
+# LOAD DATA
+
+```{r}
+#Basic stats for previous & current rookies
+prev_rooks <- read.csv("Previous_Rookies.csv")
+current_rooks <- read.csv("Current_Rookies.csv")
+
+#Advanced stats for previous & current rookies
+prev_rooks_adv <- read.csv("Previous_Rookies_ADV.csv")
+current_rooks_adv <- read.csv("Current_Rookies_ADV.csv")
+```
+
+# DATA CLEANING
+
+```{r}
+#Check number of NAs in each dataset
+cat("There are", sum(is.na(prev_rooks)), "NA values in prev_rooks.\n")
+cat("There are", sum(is.na(current_rooks)), "NA values in current_rooks.\n")
+cat("There are", sum(is.na(prev_rooks_adv)), "NA values in prev_rooks_adv.\n")
+cat("There are", sum(is.na(current_rooks_adv)), "NA values in current_rooks_adv.\n")
+```
+
+No need for any imputations.  
+
+```{r}
+#Turn categorical variables into factors
+
+prev_rooks <- prev_rooks %>%
+  mutate(
+    #Remove accents
+    Player = stri_trans_general(Player, "Latin-ASCII"),
+    Player = make.names(Player),
+    Team = make.names(Team),
+    SEASON = as.factor(SEASON),
+    ROY_winner = factor(ROY_winner, levels = c(0,1), labels = c("No","Yes"))
+  )
+
+prev_rooks_adv <- prev_rooks_adv %>%
+  mutate(
+    #Remove accents
+    PLAYER = stri_trans_general(PLAYER, "Latin-ASCII"),
+    PLAYER = make.names(PLAYER),
+    TEAM = make.names(TEAM)
+  )
+
+current_rooks <- current_rooks %>%
+  mutate(
+    Team = make.names(Team),
+    SEASON = as.factor(SEASON),
+  )
+
+current_rooks_adv <- current_rooks_adv %>%
+  mutate(
+    TEAM = make.names(TEAM)
+  )
+```
+
+Only selected seasons 2015-2025 as testing, removing any special characters/accent marks from names for modelling.  
+
+```{r}
+#Merge data
+prev_full <- prev_rooks %>%
+  left_join(prev_rooks_adv, by = c("Player" = "PLAYER", "Team" = "TEAM"))
+
+current_full <- current_rooks %>%
+  left_join(current_rooks_adv, by = c("Player" = "PLAYER", "Team" = "TEAM"))
+
+cat("There are", sum(is.na(prev_full)), "NA values in prev_full.\n")
+cat("There are", sum(is.na(current_full)), "NA values in current_full.\n")
+```
+
+Merge prev_rooks & prev_rooks_adv for FULL stats, and current_rooks & current_rooks_adv for FULL stats.  
+
+# FEATURE SELECTION
+
+```{r}
+#Drop columns with the same data (prefer per-game stats than % stats)
+cat("There are", ncol(prev_full) - 1, "predictors in the data:\n")
+names(prev_full)[-32]
+
+prev_full <- prev_full %>%
+  select(-c(GP, #Corresponds to PCT_GP
+            OREB, DREB, #Linear combination of REB
+            AST., ASTTO, ASTRAT, #Corresponds to AST
+            OREB., DREB., #Linear combination of REB.
+            REB., #Corresponds to REB
+            TORAT #Corresponds to TOV
+            )
+         )
+
+cat("After dropping similar predictors, we now have", ncol(prev_full) - 1, "predictors:\n")
+names(prev_full)[-29]
+```
+
+```{r}
+#Find highly correlated 
+numeric_vars <- names(prev_full)[sapply(prev_full, is.numeric)]
+numeric_data <- prev_full %>% select(all_of(numeric_vars))
+corr_matrix <- cor(numeric_data, use = "pairwise.complete.obs")
+corrplot::corrplot(corr_matrix, method = "color")
+
+cutoff <- 0.8
+
+#Find all high correlation pairs
+high_pairs <- which(abs(corr_matrix) > cutoff & upper.tri(corr_matrix), arr.ind = TRUE)
+
+high_corr_pairs <- data.frame(
+  var1 = rownames(corr_matrix)[high_pairs[, 1]],
+  var2 = colnames(corr_matrix)[high_pairs[, 2]],
+  correlation = corr_matrix[high_pairs]
+)
+
+high_corr_pairs
+```
+
+```{r}
+prev_full <- prev_full %>%
+  select(-c(Min, FGA, X3PA, FTA, FP, EFG., W, L,, FG., FGM))
+
+cat("After dropping highly correlated predictors, we now have", ncol(prev_full) - 1, "predictors:\n")
+names(prev_full)[-20]
+```
+
+# EXPLORATORY DATA ANALYSIS
+
+```{r}
+ggplot(prev_full, aes(SEASON)) +
+  geom_bar() +
+  labs(title = "Number of Rookies per Season") +
+   theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+The numbers of rookies drafted per season seems to have increased slightly since the early 2010s.
+
+```{r}
+cat("The distribution of Double-Doubles:\n")
+table(prev_full$DD2)
+
+cat("The distribution of Triple-Doubles:\n")
+table(prev_full$TD3)
+
+prev_full <- prev_full %>%
+  select(-c(DD2, TD3))
+
+cat("After removing Double-Doubles & Triple-Doubles, we now have", ncol(prev_full) - 1, "predictors:\n")
+names(prev_full)[-18]
+```
+
+Data is heavily concentrated at/near 0 for Double-Doubles and Triple-Doubles, therefore we will not find these variables particularly helpful in some of our models.
+
+```{r}
+g1 <- ggplot(prev_full, aes(x = PTS, color = ROY_winner)) + geom_density()
+g2 <- ggplot(prev_full, aes(x = X3PM, color = ROY_winner)) + geom_density()
+g3 <- ggplot(prev_full, aes(x = X3P., color = ROY_winner)) + geom_density()
+g4 <- ggplot(prev_full, aes(x = FTM, color = ROY_winner)) + geom_density()
+g5 <- ggplot(prev_full, aes(x = FT., color = ROY_winner)) + geom_density()
+g6 <- ggplot(prev_full, aes(x = REB, color = ROY_winner)) + geom_density()
+g7 <- ggplot(prev_full, aes(x = AST, color = ROY_winner)) + geom_density()
+g8 <- ggplot(prev_full, aes(x = TS., color = ROY_winner)) + geom_density()
+g9 <- ggplot(prev_full, aes(x = OFFRTG, color = ROY_winner)) + geom_density()
+
+grid.arrange(g1, g2, g3, g4, g5, g6, g7, g8, g9, nrow = 3, ncol = 3)
+```
+
+```{r}
+g10 <- ggplot(prev_full, aes(x = STL, color = ROY_winner)) + geom_density()
+g11 <- ggplot(prev_full, aes(x = BLK, color = ROY_winner)) + geom_density()
+g12 <- ggplot(prev_full, aes(x = PF, color = ROY_winner)) + geom_density()
+g13 <- ggplot(prev_full, aes(x = DEFRTG, color = ROY_winner)) + geom_density()
+
+grid.arrange(g10, g11, g12, g13, nrow = 2)
+```
+
+```{r}
+g14 <- ggplot(prev_full, aes(x = Age, color = ROY_winner)) + geom_density()
+g15 <- ggplot(prev_full, aes(x = TOV, color = ROY_winner)) + geom_density()
+g16 <- ggplot(prev_full, aes(x = X..., color = ROY_winner)) + geom_density()
+g17 <- ggplot(prev_full, aes(x = PCT_GP, color = ROY_winner)) + geom_density()
+g18 <- ggplot(prev_full, aes(x = NETRTG, color = ROY_winner)) + geom_density()
+g19 <- ggplot(prev_full, aes(x = USG., color = ROY_winner)) + geom_density()
+g20 <- ggplot(prev_full, aes(x = PACE, color = ROY_winner)) + geom_density()
+g21 <- ggplot(prev_full, aes(x = PIE, color = ROY_winner)) + geom_density()
+g22 <- ggplot(prev_full, aes(x = POSS, color = ROY_winner)) + geom_density()
+
+grid.arrange(g14, g15, g16, g17, g18, g19, g20, g21, g22, nrow = 3)
+```
+
+From these graphs, we expect the variables with the most separation in their density plots to be more impactful in predicting ROY (e.g. PTS, FTM, REB, AST, STL, PF, TOV, PCT_GP, USG., POSS).
+
+# BUILDING MODEL
+
+```{r}
+#Split prev_full into 70% training & 30% testing data
+#Ensure training/testing dataset has at least one ROY
+set.seed(67)
+train_index <- createDataPartition(prev_full$ROY_winner, p = 0.7, list = FALSE)
+train <- prev_full[train_index, ]
+test <- prev_full[-train_index, ]
+```
+
+```{r}
+#Create weights for modelling since ROTY winners are rare
+#Utilized ChatGPT to calculate the weights
+table(train$ROY_winner)
+
+y <- ifelse(train$ROY_winner == "Yes", 1, 0)
+n <- length(y)
+n1 <- sum(y == 1)
+n0 <- sum(y == 0)
+
+weights <- ifelse(y == 1, n / (2 * n1), n / (2 * n0))
+
+unique(weights)
+```
+
+## **Lasso Regression Model**
+
+Logistic Regression fails due to perfect separation of the response variable. Therefore, we will push the data through a Lasso Regression Model to handle perfect separation & perform feature selection.
+
+```{r}
+#Scale numeric columns
+num_cols <- sapply(train, is.numeric)
+scaled_train <- train
+scaled_train[, num_cols] <- scale(train[, num_cols], center = TRUE, scale = TRUE)
+train_mean <- attr(scale(train[, num_cols]), "scaled:center")
+train_sd   <- attr(scale(train[, num_cols]), "scaled:scale")
+
+#Build the model
+x <- model.matrix(ROY_winner ~ . -SEASON -Player -Team, data = scaled_train)[,-1]
+y <- scaled_train$ROY_winner
+lasso <- cv.glmnet(x, y, family = "binomial", alpha = 1, nfolds = 4,  weights = ifelse(y == "Yes", 44.653846, 0.505662), seed = 25)
+
+coef(lasso, s = "lambda.min")
+```
+
+We observe that the most important variables in our lasso regression model were PTS, 3PM, FTM, AST, +/-, & POSS.
+
+```{r}
+#Find the best cutoff threshold for classification
+pred_probs <- predict(lasso, newx = x, s = "lambda.min", type = "response")
+pred_obj <- prediction(pred_probs, y)
+eval <- performance(pred_obj, "acc")
+best <- which.max(slot(eval, "y.values")[[1]])
+cutoff <- slot(eval, "x.values")[[1]][best]
+cat("The best cutoff threshold value is", cutoff, ".\n")
+
+#Create a confusion matrix using the new cutoff threshold
+pred_class <- ifelse(pred_probs > 0.9577015, 1, 0)
+table(Predicted = pred_class, Actual = y)
+```
+
+Above is the confusion matrix when predicting ROTYs using the training data. The model seems to do OK, but there are some signs of underfitting (hinting towards increasing complexity in our future models).
+
+```{r}
+scaled_test <- test
+scaled_test[, num_cols] <- scale(test[, num_cols], center = train_mean, scale = train_sd)
+x_test <- model.matrix(ROY_winner ~ . -SEASON -Player -Team, data = scaled_test)[, -1]
+
+y_test <- scaled_test$ROY_winner
+
+pred_prob <- predict(lasso, newx = x_test, s = "lambda.min", type = "response")
+pred_class <- ifelse(pred_prob > 0.9691446, 1, 0)
+table(Predicted = pred_class, Actual = y_test)
+lasso_conf <- as.matrix(table(Predicted = pred_class, Actual = y_test))
+```
+
+We see that the model is not that precise when it comes to the testing dataset. This is due to the fact that ROTY winners are a relatively rare case. We observe that the lasso model only correctly classified one ROTY out of the four.
+
+For clarity, lets display the probabilities in a dataframe with the player, team, season, and whether or not they won the ROTY award.
+
+```{r}
+prob_df <- as.data.frame(pred_prob)
+merged_df <- cbind(
+  test[, c("Player", "Team", "SEASON", "ROY_winner")],
+  prob_df
+)
+
+#Rank by highest to lowest probability to win ROTY, displaying up until all 3 ROTY are shown
+merged_df <- merged_df[order(-merged_df$lambda.min), ]
+merged_df[merged_df$ROY_winner == "Yes",]
+```
+
+## **Random Forest**
+
+Random Forest is more complex than lasso regression, and lasso regression tends to miss non-linear relationships, therefore we will try for a non-parametric model to try and predict ROTY: Random Forest.
+
+Random forest is more robust to multicollinearity, therefore I will add all the predictors we removed for logistic/lasso regression.
+
+```{r}
+#Merge data
+prev_full <- prev_rooks %>%
+  left_join(prev_rooks_adv, by = c("Player" = "PLAYER", "Team" = "TEAM"))
+
+#Split prev_full into 70% training & 30% testing data
+#Ensure training/testing dataset has at least one ROY
+set.seed(67)
+train_index <- createDataPartition(prev_full$ROY_winner, p = 0.7, list = FALSE)
+train <- prev_full[train_index, ]
+test <- prev_full[-train_index, ]
+```
+
+```{r}
+#Build the model, factoring in class imbalances within the training dataset
+set.seed(67)
+rf_model <- randomForest(
+  ROY_winner ~ . -SEASON -Player -Team,
+  data = train,
+  ntree = 500,
+  mtry = 4,
+  importance = TRUE,
+  classwt = c("No" = 0.505662, "Yes" = 44.653846),
+  sampsize = c("No" = 12, "Yes" = 12)
+)
+
+rf_model
+```
+
+```{r}
+#Assume a threshold of 0.83
+prob <- predict(rf_model, newdata = train, type = "prob")
+pred <- ifelse(prob[, 2] > 0.83, "Yes", "No")
+table(pred, train$ROY_winner)
+
+prob <- predict(rf_model, newdata = test, type = "prob")
+pred <- ifelse(prob[, "Yes"] > 0.83, "Yes", "No")
+table(pred, test$ROY_winner)
+rffull_conf <- as.matrix(table(pred, test$ROY_winner))
+```
+
+We see that the model is better than LASSO regression at predicting ROTY on unseen data. Now, our model is better at finding the true positives within our testing set, however, we see this model over classifying ROTY winners (false positives).
+
+(It is important to note that these thresholds are calculated intuition and what best fits the training data. Therefore, the comparison between lasso regression and random forest may be misinterpreted via this way)
+
+For clarity, lets display the probabilities in a dataframe with the player, team, season, and whether or not they won the ROTY award.
+
+```{r}
+prob_df <- as.data.frame(prob)
+merged_df <- cbind(
+  test[, c("Player", "Team", "SEASON", "ROY_winner")],
+  prob_df
+)
+
+#Rank by highest to lowest probability to win ROTY, displaying up until all 3 ROTY are shown
+merged_df <- merged_df[order(-merged_df$Yes), ]
+head(merged_df[, -5], 7)
+```
+
+To attempt to make the model more interpretable & simpler, we will sacrifice some bias to decrease the variance of the model by only choosing variables that are the most important in the model.
+
+```{r}
+varImpPlot(rf_model, type = 1)
+```
+
+```{r}
+imp <- importance(rf_model)
+selected_vars <- rownames(imp)[order(imp[,"MeanDecreaseAccuracy"], decreasing = TRUE)][1:20]
+cat("From the Variable Importance Plot, it seems that the top 20 variables that contribute the most towards the model are:\n")
+selected_vars
+```
+
+**Random Forest (Tuned)**
+
+```{r}
+#Build the model based on the Variable Importance Plot
+formula <- as.formula(paste("ROY_winner ~", paste(selected_vars, collapse = " + ")))
+
+set.seed(67)
+rf_tuned <- randomForest(
+  formula,
+  data = train,
+  ntree = 500,
+  mtry = 4,
+  importance = TRUE,
+  classwt = c("No" = 0.505662, "Yes" = 44.653846),
+  sampsize = c("No" = 12, "Yes" = 12)
+)
+
+rf_tuned
+```
+
+```{r}
+#Assume a threshold of 0.87
+pred_tuned <- predict(rf_tuned, newdata = train, type = "prob")
+tuned_prob <- ifelse(pred_tuned[, "Yes"] > 0.87, "Yes", "No")
+table(tuned_prob, train$ROY_winner)
+
+pred_tuned <- predict(rf_tuned, newdata = test, type = "prob")
+tuned_prob <- ifelse(pred_tuned[, "Yes"] > 0.87, "Yes", "No")
+table(tuned_prob, test$ROY_winner)
+
+rftuned_conf <- as.matrix(table(tuned_prob, test$ROY_winner))
+```
+
+The reduced model seems to do better than the full model when it comes to the training data (unseen), but does worse when it comes to the testing data. However, the reduced model is more interpretable than the full model. This indicates some overfitting within this reduced model.
+
+```{r}
+prob_df <- as.data.frame(pred_tuned)
+merged_df <- cbind(
+  test[, c("Player", "Team", "SEASON", "ROY_winner")],
+  prob_df
+)
+
+#Rank by highest to lowest probability to win ROTY, displaying up until all 3 ROTY are shown
+merged_df <- merged_df[order(-merged_df$Yes), ]
+merged_df[merged_df$ROY_winner == "Yes",]
+```
+
+**Random Forest (Tuned & Cross-validated)**
+
+```{r}
+#Build the model based on the Variable Importance Plot
+#Use 5-fold cross-validation to reduce overfitting
+ctrl <- trainControl(method = "cv", number = 5)
+
+set.seed(67)
+rf_cv <- train(
+  formula,
+  data = train,
+  method = "rf",
+  trControl = ctrl,
+  tuneGrid = data.frame(mtry = 2:10),
+  ntree = 500,
+  classwt = c("No" = 0.505662, "Yes" = 44.653846),
+  sampsize = c("No" = 9, "Yes" = 9)
+)
+
+rf_cv
+```
+
+```{r}
+#Assume a threshold of 0.78
+pred_cv <- predict(rf_cv, newdata = train, type = "prob")
+cv_prob <- ifelse(pred_cv[, "Yes"] > 0.78, "Yes", "No")
+table(cv_prob, train$ROY_winner)
+
+pred_cv <- predict(rf_cv, newdata = test, type = "prob")
+cv_prob <- ifelse(pred_cv[, "Yes"] > 0.78, "Yes", "No")
+table(cv_prob, test$ROY_winner)
+
+rfcv_conf <- as.matrix(table(cv_prob, test$ROY_winner))
+```
+
+The cross-validated model seems to do worse than the full model and better than the reduced model when it comes to the testing data (unseen), but does slightly better on the training data in comparison to the full model. However, the cross-validated model is more interpretable & more consistent than the full model.
+
+```{r}
+prob_df <- as.data.frame(pred_cv)
+merged_df <- cbind(
+  test[, c("Player", "Team", "SEASON", "ROY_winner")],
+  prob_df
+)
+
+#Rank by highest to lowest probability to win ROTY, displaying up until all 3 ROTY are shown
+merged_df <- merged_df[order(-merged_df$Yes), ]
+merged_df[merged_df$ROY_winner == "Yes",]
+```
+
+# TESTING USING CURRENT ROOKIES
+
+```{r}
+# Function to compute Precision, Recall, and F1
+compute_metrics <- function(conf_matrix) {
+  TP <- conf_matrix[2,2]
+  FP <- conf_matrix[1,2]
+  FN <- conf_matrix[2,1]
+  precision <- ifelse((TP + FP) > 0, TP / (TP + FP), 0)
+  recall <- ifelse((TP + FN) > 0, TP / (TP + FN), 0)
+  f1 <- ifelse((precision + recall) > 0, 2 * (precision * recall) / (precision + recall), 0)
+  return(c(Precision = precision, Recall = recall, F1 = f1))
+}
+
+evaluation <- rbind(
+  LASSO = compute_metrics(rbind(lasso_conf, 0)),
+  RF_Full = compute_metrics(rffull_conf),
+  RF_Tuned = compute_metrics(rftuned_conf),
+  RF_CV = compute_metrics(rbind(rfcv_conf, 0))
+)
+print(evaluation)
+```
+
+The Random Forest Full Model and the Random Forest Tuned Model performed similarly among the three evaluation metrics.
+
+```{r}
+#Remove all variables from the testing dataset as we did with the training dataset
+current_full <- current_full %>%
+  mutate(across(where(is.character), as.factor)) %>%
+  select(
+    -c(
+      GP,         # Corresponds to PCT_GP
+      OREB, DREB, # Linear combination of REB
+      AST., ASTTO, ASTRAT, # Corresponds to AST
+      OREB., DREB., # Linear combination of REB.
+      REB.,       # Corresponds to REB
+      TORAT,      # Corresponds to TOV
+      Min, FGA, X3PA, FTA, FP, 
+      EFG., W, L, FG., FGM, DD2, TD3, TM_GP
+    )
+  )
+```
+
+## **Lasso Model**
+
+```{r}
+lasso_current <- current_full %>%
+  select(-SEASON)
+
+#Scale numeric columns
+num_cols <- sapply(lasso_current, is.numeric)
+
+scaled_current <- lasso_current
+scaled_current[, num_cols] <- scale(lasso_current[, num_cols], center = train_mean, scale = train_sd)
+
+x_current <- model.matrix(~ . -Player -Team, data = scaled_current)[,-1]
+pred_prob <- predict(lasso, newx = x_current, s = "lambda.min", type = "response")
+
+#Show the top 10 rookies with the highest probability of become ROTY
+df <- data.frame(player_name = lasso_current$Player, probability = pred_prob)
+df <- df[order(-df$lambda.min), ]
+head(df, 5)
+tail(df, 5)
+```
+
+We can observe that the probability that each player in the 2025-2026 rookie class wins ROTY is either really high (100%) or really low (<0.1%) for our lasso regression model. Therefore, we will not go through with this model.
+
+## **Random Forest Full Model**
+
+```{r}
+current_full <- current_rooks %>%
+  left_join(current_rooks_adv, by = c("Player" = "PLAYER", "Team" = "TEAM"))
+```
+
+```{r}
+prob <- predict(rf_model, newdata = current_full, type = "prob")[, "Yes"]
+df <- data.frame(player_name = current_full$Player, probability = prob)
+df <- df[order(-df$probability), ]
+head(df, 10)
+
+write.csv(df, "predictions.csv", row.names = FALSE)
+```
+
+All players correspond to the Kia Rookie Ladder list (except for Dylan Harper). Probabilities seem more or less expected. Surprising to see Cedric Coward (3rd on the Kia Rookie Ladder as of November 26th) having only the 6th highest probability of winning ROTY.
+
+## **Random Forest Reduced Model**
+
+```{r}
+prob <- predict(rf_tuned, newdata = current_full, type = "prob")[, "Yes"]
+df <- data.frame(player_name = current_full$Player, probability = prob)
+df <- df[order(-df$probability), ]
+head(df, 10)
+```
+
+Surprising to see Derik Queen having a very high probability to win ROTY (~80%).
+
+## **Random Forest Reduced & Cross-Validated Model**
+
+```{r}
+prob <- predict(rf_cv, newdata = current_full, type = "prob")[, "Yes"]
+df <- data.frame(player_name = current_full$Player, probability = prob)
+df <- df[order(-df$probability), ]
+head(df, 10)
+```
+
+Throughout the reduced and cross-validated Random Forest models, we see Derik Queen top the charts when it comes to winning ROTY (though by a relatively small margin). What is surprising is that Kon Knueppel and Cedric Coward are relatively lower compared to the other top 10 players with the highest probabilities. However, it seems that the full Random Forest model seems to do the best when it comes to unseen data. The reduced and cross-validated models became too simple for the data. By decreasing the variance, we face the bias-variance tradeoff, therefore we increase bias and weaken our models ability to capture non-linear relationships with reduced models.
+
+Due to the previous findings I believe that the Random Forest Full Model does the best job at predicting ROTY on unseen data (at the expense of interpretabiliity).
+
+Next steps:
+- Use a time-based training/testing split
+- Try other models
+
+**Sources:**  
+- OpenAI ChatGPT (2025). Used for guidance on code organization.
