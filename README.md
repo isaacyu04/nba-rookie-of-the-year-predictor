@@ -2,6 +2,8 @@
 
 A predictive analytics project completed for the NBA Future Analytics Stars Tech Challenge / Rising Stars Analyst Program. The analysis estimates 2025–26 NBA Rookie of the Year likelihoods from rookie regular-season statistics.
 
+This project won from 2400+ submissions, accepting me into the 3rd cohort of the NBA Future Analytics Stars.
+
 ## Portfolio artifact
 
 - [`ROY_Predictor.Rmd`](ROY_Predictor.Rmd) — complete R Markdown analysis: preparation, exploratory analysis, model training, evaluation, and scoring.
