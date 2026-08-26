@@ -4,6 +4,8 @@ A predictive analytics project completed for the NBA Future Analytics Stars Tech
 
 This project won from 2400+ submissions, accepting me into the 3rd cohort of the NBA Future Analytics Stars.
 
+For a quick video explanation of this project, click this link: [https://youtu.be/EM-kIXQVa9s](url)
+
 ## Portfolio artifact
 
 - [`ROY_Predictor.Rmd`](ROY_Predictor.Rmd) — complete R Markdown analysis: preparation, exploratory analysis, model training, evaluation, and scoring.
